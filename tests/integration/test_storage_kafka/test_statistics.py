@@ -3,6 +3,7 @@ import time
 import pytest
 
 from helpers.cluster import ClickHouseCluster
+from helpers.network import PartitionManager
 from helpers.test_tools import TSV
 import helpers.kafka.common as k
 
@@ -10,7 +11,7 @@ import helpers.kafka.common as k
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
     "instance",
-    main_configs=["configs/kafka_no_statistics.xml", "configs/named_collection.xml"],
+    main_configs=["configs/named_collection.xml"],
     user_configs=["configs/users.xml"],
     with_kafka=True,
     with_zookeeper=True,
@@ -73,16 +74,10 @@ def kafka_setup_teardown():
 
 
 def test_statistics_enabled_by_default(kafka_cluster):
-    """rdkafka_stat must be populated without any explicit statistics config (pre-seeded default).
-
-    Covers both engines: the default for StorageKafka was dead code (has_property() is always true
-    for a known librdkafka property), and StorageKafka2 used to override even an explicit value."""
+    """rdkafka_stat must be populated without any statistics config, for both engines."""
     topic_name = "topic_statistics_default"
 
-    # Use distinct consumer groups: the old engine subscribes and commits offsets to the broker for its
-    # group; if both engines shared one group, the old engine's commits would move the start offset of the
-    # Keeper-backed engine (assign() without an explicit offset falls back to the broker-committed one
-    # before auto.offset.reset), making which messages the second engine sees timing-dependent.
+    # Distinct groups: the old engine's broker commits would move the start offset of the Keeper-backed one.
     old_engine_table = k.generate_old_create_table_query(
         "kafka_old", "a String", topic_list=topic_name, consumer_group="statistics_old_engine", format="LineAsString"
     )
@@ -122,10 +117,7 @@ def test_statistics_enabled_by_default(kafka_cluster):
 
 
 def test_statistics_survive_mv_detach(kafka_cluster):
-    """StorageKafka2 must keep serving librdkafka events after the materialized view is detached.
-
-    Without the drain, statistics events accumulate in the librdkafka reply queue indefinitely
-    (a live memory leak) while nobody polls the idle consumer."""
+    """StorageKafka2 must keep serving librdkafka events after the materialized view is detached."""
     topic_name = "topic_statistics_detach"
 
     create_kafka_query = k.generate_new_create_table_query(
@@ -164,6 +156,50 @@ def test_statistics_survive_mv_detach(kafka_cluster):
             check_callback=lambda x: len(TSV(x)) == 2,
         )
         assert TSV(instance.query("SELECT * FROM test.dst ORDER BY a")) == TSV("message_1\nmessage_2")
+
+
+def test_statistics_survive_keeper_outage(kafka_cluster):
+    """StorageKafka2 must keep serving librdkafka events while its replica is inactive after a Keeper session loss."""
+    topic_name = "topic_statistics_keeper_outage"
+
+    create_kafka_query = k.generate_new_create_table_query(
+        "kafka", "a String", topic_list=topic_name, format="LineAsString"
+    )
+
+    with k.existing_kafka_topic(k.get_admin_client(kafka_cluster), topic_name):
+        instance.query(
+            f"""
+            CREATE TABLE test.dst (a String) ENGINE = MergeTree() ORDER BY tuple();
+            {create_kafka_query};
+            CREATE MATERIALIZED VIEW test.kafka_mv TO test.dst AS SELECT a FROM test.kafka;
+            """
+        )
+
+        k.kafka_produce(kafka_cluster, topic_name, ["message_1"])
+        instance.query_with_retry(
+            "SELECT * FROM test.dst",
+            retry_count=60,
+            sleep_time=1,
+            check_callback=lambda x: len(TSV(x)) == 1,
+        )
+        wait_for_statistics("kafka")
+
+        with PartitionManager() as pm:
+            pm.drop_instance_zk_connections(instance)
+            instance.wait_for_log_line(
+                "ZooKeeper session has expired. Switching to a new session",
+                timeout=120,
+                look_behind_lines=0,
+            )
+            wait_for_statistics("kafka")
+
+        k.kafka_produce(kafka_cluster, topic_name, ["message_2"])
+        instance.query_with_retry(
+            "SELECT * FROM test.dst",
+            retry_count=120,
+            sleep_time=1,
+            check_callback=lambda x: len(TSV(x)) == 2,
+        )
 
 
 if __name__ == "__main__":
